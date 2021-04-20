@@ -16,6 +16,7 @@
 #include "utils/MinimumSpanningTree.h" //For connecting the correct nodes together to form an efficient tree.
 #include "utils/polygon.h" //For splitting polygons into parts.
 #include "utils/polygonUtils.h" //For moveInside.
+#include <omp.h>
 
 #define SQRT_2 1.4142135623730950488 //Square root of 2.
 #define CIRCLE_RESOLUTION 10 //The number of vertices in each circle.
@@ -44,6 +45,9 @@ TreeSupport::TreeSupport(const SliceDataStorage& storage)
 
 void TreeSupport::generateSupportAreas(SliceDataStorage& storage)
 {
+	double start;
+	double end;
+
     const Settings& group_settings = Application::getInstance().current_slice->scene.current_mesh_group->settings;
     const bool global_use_tree_support =
         group_settings.get<bool>("support_enable")&&
@@ -60,6 +64,7 @@ void TreeSupport::generateSupportAreas(SliceDataStorage& storage)
         return;
     }
 
+	start = omp_get_wtime();
     std::vector<std::vector<Node*>> contact_nodes(storage.support.supportLayers.size()); //Generate empty layers to store the points in.
     for (SliceMeshStorage& mesh : storage.meshes)
     {
@@ -68,13 +73,22 @@ void TreeSupport::generateSupportAreas(SliceDataStorage& storage)
             generateContactPoints(mesh, contact_nodes);
         }
     }
+	end = omp_get_wtime();
+	printf("GREPME: generateSupportAreas - Contactpoints %f seconds\n", end - start);
 
+	start = omp_get_wtime();
     //Drop nodes to lower layers.
     dropNodes(contact_nodes);
+	end = omp_get_wtime();
+	printf("GREPME: generateSupportAreas - dropNodes %f seconds\n", end - start);
 
+	start = omp_get_wtime();
     //Generate support areas.
     drawCircles(storage, contact_nodes);
+	end = omp_get_wtime();
+	printf("GREPME: generateSupportAreas - drawCircles %f seconds\n", end - start);
 
+	start = omp_get_wtime();
     for (auto& layer : contact_nodes)
     {
         for (Node* p_node : layer)
@@ -84,6 +98,8 @@ void TreeSupport::generateSupportAreas(SliceDataStorage& storage)
         layer.clear();
     }
     contact_nodes.clear();
+	end = omp_get_wtime();
+	printf("GREPME: generateSupportAreas - cleanup %f seconds\n", end - start);
 
     storage.support.generated = true;
 }
@@ -207,6 +223,39 @@ void TreeSupport::drawCircles(SliceDataStorage& storage, const std::vector<std::
 
 void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
 {
+	double grouping_start;
+	double grouping_end;
+	double grouping_time = 0;
+
+	double Spanning_Tree_start;
+	double Spanning_Tree_end;
+	double Spanning_Tree_time = 0;
+
+	double First_Pass_start;
+	double First_Pass_end;
+	double First_Pass_time = 0;
+
+	double Second_Pass_start;
+	double Second_Pass_end;
+	double Second_Pass_time = 0;
+
+	double Second_Pass_Move_Together_start;
+	double Second_Pass_Move_Together_end;
+	double Second_Pass_Move_Together_time = 0;
+
+	double Second_Pass_Avoid_Colission_start;
+	double Second_Pass_Avoid_Colission_end;
+	double Second_Pass_Avoid_Colission_time = 0;
+	int Second_Pass_Avoid_Colission_runcount = 0;
+
+	double Second_Pass_insertDropNode_start;
+	double Second_Pass_insertDropNode_end;
+	double Second_Pass_insertDropNode_time = 0;
+
+	double mid_air_start;
+	double mid_air_end;
+	double mid_air_time = 0;
+
     const Settings& mesh_group_settings = Application::getInstance().current_slice->scene.current_mesh_group->settings;
     //Use Minimum Spanning Tree to connect the points on each layer and move them while dropping them down.
     const coord_t layer_height = mesh_group_settings.get<coord_t>("layer_height");
@@ -225,6 +274,7 @@ void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
         auto& layer_contact_nodes = contact_nodes[layer_nr];
         std::deque<std::pair<size_t, Node*>> unsupported_branch_leaves; // All nodes that are leaves on this layer that would result in unsupported ('mid-air') branches.
 
+		grouping_start = omp_get_wtime();
         //Group together all nodes for each part.
         std::vector<PolygonsPart> parts = volumes_.getAvoidance(0, layer_nr).splitIntoParts();
         std::vector<std::unordered_map<Point, Node*>> nodes_per_part;
@@ -279,6 +329,11 @@ void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
             nodes_per_part[closest_part + 1][node.position] = p_node; //Index + 1 because the 0th index is the outside part.
 
         }
+		grouping_end = omp_get_wtime();
+        grouping_time += grouping_end - grouping_start;
+
+
+		Spanning_Tree_start = omp_get_wtime();
         //Create a MST for every part.
         std::vector<MinimumSpanningTree> spanning_trees;
         for (const std::unordered_map<Point, Node*>& group : nodes_per_part)
@@ -293,6 +348,7 @@ void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
 
         for (size_t group_index = 0; group_index < nodes_per_part.size(); group_index++)
         {
+            First_Pass_start = omp_get_wtime();
             const MinimumSpanningTree& mst = spanning_trees[group_index];
             //In the first pass, merge all nodes that are close together.
             std::unordered_set<Node*> to_delete;
@@ -358,6 +414,11 @@ void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
                     }
                 }
             }
+            First_Pass_end = omp_get_wtime();
+            First_Pass_time += First_Pass_end - First_Pass_start;
+
+
+            Second_Pass_start = omp_get_wtime();
             //In the second pass, move all middle nodes.
             for (const std::pair<const Point, Node*>& entry : nodes_per_part[group_index])
             {
@@ -391,6 +452,8 @@ void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
                         continue;
                     }
                 }
+
+                Second_Pass_Move_Together_start = omp_get_wtime();
                 Point next_layer_vertex = node.position;
                 const std::vector<Point> neighbours = mst.adjacentNodes(node.position);
                 if (neighbours.size() > 1 || (neighbours.size() == 1 && vSize2(neighbours[0] - node.position) >= maximum_move_distance * maximum_move_distance)) //Only nodes that aren't about to collapse.
@@ -410,6 +473,8 @@ void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
                         next_layer_vertex += normal(sum_direction, maximum_move_distance);
                     }
                 }
+                Second_Pass_Move_Together_end = omp_get_wtime();
+                Second_Pass_Move_Together_time += Second_Pass_Move_Together_end - Second_Pass_Move_Together_start;
 
                 const coord_t branch_radius_node = [&]() -> coord_t
                 {
@@ -422,19 +487,33 @@ void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
                         return branch_radius * (node.distance_to_top + 1) / tip_layers;
                     }
                 }();
+
+                Second_Pass_Avoid_Colission_start = omp_get_wtime();
                 if (group_index == 0)
                 {
                     //Avoid collisions.
                     const coord_t maximum_move_between_samples = maximum_move_distance + radius_sample_resolution + 100; //100 micron extra for rounding errors.
                     PolygonUtils::moveOutside(volumes_.getAvoidance(branch_radius_node, layer_nr - 1), next_layer_vertex, radius_sample_resolution + 100, maximum_move_between_samples * maximum_move_between_samples); //Some extra offset to prevent rounding errors with the sample resolution.
                 }
+                Second_Pass_Avoid_Colission_end = omp_get_wtime();
+                Second_Pass_Avoid_Colission_time += Second_Pass_Avoid_Colission_end - Second_Pass_Avoid_Colission_start;
+                Second_Pass_Avoid_Colission_runcount += 1;
 
+                Second_Pass_insertDropNode_start = omp_get_wtime();
                 const bool to_buildplate = !volumes_.getAvoidance(branch_radius_node, layer_nr - 1).inside(next_layer_vertex);
                 Node* next_node = new Node(next_layer_vertex, node.distance_to_top + 1, node.skin_direction, node.support_roof_layers_below - 1, to_buildplate, p_node);
                 insertDroppedNode(contact_nodes[layer_nr - 1], next_node);
+                Second_Pass_insertDropNode_end = omp_get_wtime();
+                Second_Pass_insertDropNode_time += Second_Pass_insertDropNode_end - Second_Pass_insertDropNode_start;
             }
+            Second_Pass_end = omp_get_wtime();
+            Second_Pass_time += Second_Pass_end - Second_Pass_start;
         }
 
+		Spanning_Tree_end = omp_get_wtime();
+		Spanning_Tree_time += Spanning_Tree_end - Spanning_Tree_start;
+
+		mid_air_start = omp_get_wtime();
         // Prune all branches that couldn't find support on either the model or the buildplate (resulting in 'mid-air' branches).
         for (;! unsupported_branch_leaves.empty(); unsupported_branch_leaves.pop_back())
         {
@@ -456,11 +535,22 @@ void TreeSupport::dropNodes(std::vector<std::vector<Node*>>& contact_nodes)
                 }
             }
         }
+		mid_air_end = omp_get_wtime();
+		mid_air_time += mid_air_end - mid_air_start;
 
         const double progress_current = (contact_nodes.size() - layer_nr) * PROGRESS_WEIGHT_DROPDOWN;
         const double progress_total = contact_nodes.size() * PROGRESS_WEIGHT_DROPDOWN + contact_nodes.size() * PROGRESS_WEIGHT_AREAS;
         Progress::messageProgress(Progress::Stage::SUPPORT, progress_current, progress_total);
     }
+
+	printf("GREPME: dropNodes - Grouping %f seconds\n", grouping_time);
+	printf("GREPME: dropNodes - SpanningTree %f seconds\n", Spanning_Tree_time);
+	printf("GREPME: dropNodes - SpanningTree - FirstPass %f seconds\n", First_Pass_time);
+	printf("GREPME: dropNodes - SpanningTree - SecondPass %f seconds\n", Second_Pass_time);
+	printf("GREPME: dropNodes - SpanningTree - SecondPass - Move Together %f seconds\n", Second_Pass_Move_Together_time);
+	printf("GREPME: dropNodes - SpanningTree - SecondPass - Avoid Collision %f seconds average %f seconds\n", Second_Pass_Avoid_Colission_time, Second_Pass_Avoid_Colission_time / Second_Pass_Avoid_Colission_runcount);
+	printf("GREPME: dropNodes - SpanningTree - SecondPass - insertDropNode %f seconds\n", Second_Pass_insertDropNode_time);
+	printf("GREPME: dropNodes - MidAirBranches %f seconds\n", mid_air_time);
 
     for (Node *node : to_free_node_set)
     {
